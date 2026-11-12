@@ -2,6 +2,8 @@ from contextlib import nullcontext
 from http.client import HTTPException
 from http.cookiejar import CookieJar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
+import binascii
 import itertools
 import json
 import os
@@ -23,15 +25,30 @@ class ToolError(Exception):
     pass
 
 
-# Standard DMT/CTA timings: pixel clock (kHz), H sync start/end/total,
+# Pixel clock (kHz), H sync start/end/total,
 # V sync start/end/total, and EDID separate-sync polarity flags.
+# Use standard DMT/CTA timings where encodable in a DTD; other 50/30Hz
+# modes retain the 60Hz blanking and adjust the pixel clock.
 EDID_TIMINGS = {
     (640, 480, 60): (25175, 656, 752, 800, 490, 492, 525, 0x18),
+    (640, 480, 50): (21000, 656, 752, 800, 490, 492, 525, 0x18),
+    (640, 480, 30): (12600, 656, 752, 800, 490, 492, 525, 0x18),
     (800, 600, 60): (40000, 840, 968, 1056, 601, 605, 628, 0x1E),
+    (800, 600, 50): (33158, 840, 968, 1056, 601, 605, 628, 0x1E),
+    (800, 600, 30): (19895, 840, 968, 1056, 601, 605, 628, 0x1E),
     (1024, 768, 60): (65000, 1048, 1184, 1344, 771, 777, 806, 0x18),
+    (1024, 768, 50): (54163, 1048, 1184, 1344, 771, 777, 806, 0x18),
+    (1024, 768, 30): (32498, 1048, 1184, 1344, 771, 777, 806, 0x18),
     (1280, 720, 60): (74250, 1390, 1430, 1650, 725, 730, 750, 0x1E),
+    (1280, 720, 50): (74250, 1720, 1760, 1980, 725, 730, 750, 0x1E),
+    # CTA 720p30's 1760-pixel H sync offset exceeds the DTD's 10-bit field.
+    (1280, 720, 30): (37125, 1390, 1430, 1650, 725, 730, 750, 0x1E),
     (1280, 1024, 60): (108000, 1328, 1440, 1688, 1025, 1028, 1066, 0x1E),
+    (1280, 1024, 50): (89970, 1328, 1440, 1688, 1025, 1028, 1066, 0x1E),
+    (1280, 1024, 30): (53982, 1328, 1440, 1688, 1025, 1028, 1066, 0x1E),
     (1920, 1080, 60): (148500, 2008, 2052, 2200, 1084, 1089, 1125, 0x1E),
+    (1920, 1080, 50): (148500, 2448, 2492, 2640, 1084, 1089, 1125, 0x1E),
+    (1920, 1080, 30): (74250, 2008, 2052, 2200, 1084, 1089, 1125, 0x1E),
 }
 
 
@@ -39,7 +56,7 @@ def resolution_edid(template, width, height, refresh_rate):
     timing = EDID_TIMINGS.get((width, height, refresh_rate))
     if timing is None:
         raise ToolError("Unsupported EDID mode; use 640x480, 800x600, 1024x768, "
-                        "1280x720, 1280x1024 or 1920x1080 at 60Hz")
+                        "1280x720, 1280x1024 or 1920x1080 at 60, 50 or 30Hz")
     try:
         original = bytes.fromhex(template)
     except (TypeError, ValueError) as error:
@@ -114,6 +131,18 @@ def integer_schema(low, high, **extra):
 KEY_SCHEMA = {"type": ["string", "integer"], "minLength": 1,
               "minimum": 1, "maximum": 231}
 SOURCE_SCHEMA = {"type": "string", "enum": ["storage", "sd"], "default": "storage"}
+STORAGE_STATUS_FIELDS = (
+    ("virtual_media", "getVirtualMediaState"),
+    ("storage", "getStorageSpace"),
+)
+DIAGNOSTIC_FIELDS = (
+    ("device_id", "getDeviceID"),
+    ("version", "getLocalUpdateStatus"),
+    ("network", "getNetworkState"),
+    ("video", "getVideoState"),
+    ("usb", "getUSBState"),
+    ("edid", "getEDID"),
+) + STORAGE_STATUS_FIELDS
 
 
 def tool(name, description, properties=None, required=()):
@@ -152,9 +181,22 @@ TOOLS = [
          "Printable ASCII, newline, carriage return and tab only; no Unicode/IME conversion.",
          {"text": {"type": "string", "maxLength": 1000}}, ("text",)),
     tool("kvm_get_status", "Read video input and USB attachment status."),
-    tool("kvm_list_storage_files", "List stored files including filename, size and createdAt. "
+    tool("kvm_get_diagnostics", "Collect device ID, local app/system versions, network, video, "
+         "USB, current EDID, virtual media and internal shared-storage capacity in bytes. "
+         "Reads sequentially without changing settings or querying SD storage. "
+         "Returns data, per-field errors and complete; partial results remain usable."),
+    tool("kvm_get_storage_status", "Read the current virtual medium (null if unmounted) and "
+         "internal shared-storage filesystem bytesUsed/bytesFree. Does not query or mount SD. "
+         "Returns data, per-field errors and complete; partial results remain usable."),
+    tool("kvm_list_storage_files", "List root-level shared-storage files, including files shared "
+         "with the target host over MTP. Returns filename, size in bytes and createdAt "
+         "(actually the modification time). Does not list directories or their contents. "
          "source=storage selects internal storage; source=sd selects the SD card.",
          {"source": SOURCE_SCHEMA}),
+    tool("kvm_delete_storage_file", "Permanently delete one stored file from internal storage or SD, "
+         "including an incomplete upload. Does not unmount virtual media.", {
+             "filename": {"type": "string", "minLength": 1}, "source": SOURCE_SCHEMA,
+         }, ("filename",)),
     tool("kvm_mount_iso", "Mount an existing ISO as CDROM from internal storage or SD. "
          "Replaces any currently mounted virtual medium; does not upload files.", {
              "filename": {"type": "string", "minLength": 1}, "source": SOURCE_SCHEMA,
@@ -162,14 +204,22 @@ TOOLS = [
     tool("kvm_unmount_iso", "Unmount the current virtual medium. PicoKVM may also clear "
          "its matching auto-mount setting and rebuild USB if the medium is busy."),
     tool("kvm_set_screen_resolution", "Set EDID to advertise one preferred display mode: "
-         "640x480, 800x600, 1024x768, 1280x720, 1280x1024 or 1920x1080 at 60Hz. "
+         "640x480, 800x600, 1024x768, 1280x720, 1280x1024 or 1920x1080 at 60, 50 or 30Hz. "
          "Persists on PicoKVM; the target OS decides when to switch resolution.", {
              "width": integer_schema(640, 1920), "height": integer_schema(480, 1080),
-             "refresh_rate": integer_schema(60, 60, default=60),
+             "refresh_rate": integer_schema(30, 60, enum=[60, 50, 30], default=60),
          }, ("width", "height")),
+    tool("kvm_reset_edid", "Restore the firmware's default EDID. The target OS may need to "
+         "re-detect the display. Set EDID_AUTOSET=0 to keep the default across bridge restarts; "
+         "otherwise startup sets 1024x768 again."),
+    tool("kvm_capture_screenshot", "Capture a JPEG image using the device MCP server. "
+         "Requires PICOKVM_MCP_API_KEY and firmware supporting Streamable HTTP. "
+         "The device also saves the screenshot locally.", {
+             "timeout_ms": integer_schema(1000, 30000, default=5000),
+         }),
 ]
 TOOL_BY_NAME = {item["name"]: item for item in TOOLS}
-INPUT_TOOLS = {item["name"] for item in TOOLS[:6]} | {"kvm_set_screen_resolution"}
+INPUT_TOOLS = {item["name"] for item in TOOLS[:6]} | {"kvm_set_screen_resolution", "kvm_reset_edid"}
 
 
 def validate(value, schema, label="arguments"):
@@ -202,6 +252,12 @@ def validate(value, schema, label="arguments"):
             raise ToolError("{} has an invalid length".format(label))
     elif not schema["minimum"] <= value <= schema["maximum"]:
         raise ToolError("{} must be between {} and {}".format(label, schema["minimum"], schema["maximum"]))
+
+
+def validate_storage_filename(filename):
+    if (filename in (".", "..") or ".." in filename or "/" in filename
+            or "\\" in filename or "\x00" in filename):
+        raise ToolError("filename must be a storage file name, without path components")
 
 
 class PicoKVMClient:
@@ -269,6 +325,184 @@ class PicoKVMClient:
             return response.get("result")
 
 
+class NoMCPRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, *args, **kwargs):
+        # Never forward the device API key to a redirected endpoint.
+        return None
+
+
+class PicoKVMMCPClient:
+    """Small Streamable HTTP client, independent of the web RPC login session."""
+
+    PROTOCOL_VERSION = "2025-03-26"
+
+    def __init__(self, base_url=None, url=None, api_key=None):
+        self.base_url = base_url if base_url is not None else os.environ.get(
+            "PICOKVM_BASE_URL", "http://127.0.0.1")
+        self.url = url if url is not None else os.environ.get("PICOKVM_MCP_URL")
+        self.api_key = api_key if api_key is not None else os.environ.get("PICOKVM_MCP_API_KEY")
+        self.opener = urllib.request.build_opener(NoMCPRedirect())
+        self.lock = threading.Lock()
+        self.request_ids = itertools.count(1)
+        self.initialized = False
+        self.session_id = None
+
+    def _configure(self):
+        if not self.api_key or any(char.isspace() for char in self.api_key):
+            raise ToolError("Set PICOKVM_MCP_API_KEY to the device MCP API key")
+        if self.url is None:
+            try:
+                host = urllib.parse.urlsplit(self.base_url).hostname
+            except ValueError:
+                host = None
+            if not host:
+                raise ToolError("Invalid PICOKVM_BASE_URL; set PICOKVM_MCP_URL explicitly")
+            if ":" in host:
+                host = "[{}]".format(host)
+            self.url = "http://{}:8081/mcp".format(host)
+        try:
+            parsed = urllib.parse.urlsplit(self.url)
+            valid = (parsed.scheme in ("http", "https") and parsed.hostname
+                     and parsed.username is None and parsed.password is None
+                     and not parsed.fragment and parsed.port != 0
+                     and not any(char.isspace() for char in self.url))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ToolError("PICOKVM_MCP_URL must be a complete HTTP(S) endpoint URL")
+
+    @staticmethod
+    def _rpc_result(message, request_id):
+        if (not isinstance(message, dict) or message.get("jsonrpc") != "2.0"
+                or type(message.get("id")) is not int or message["id"] != request_id
+                or ("result" in message) == ("error" in message)):
+            raise ToolError("Invalid device MCP JSON-RPC response or mismatched ID")
+        if "error" in message:
+            error = message["error"]
+            code = error.get("code") if isinstance(error, dict) else None
+            # Do not reflect arbitrary response bodies (which may contain secrets).
+            if type(code) is int:
+                raise ToolError("Device MCP JSON-RPC error {}".format(code))
+            raise ToolError("Invalid device MCP JSON-RPC error")
+        return message["result"]
+
+    def _read_response(self, response, request_id, deadline):
+        content_type = response.headers.get_content_type()
+        if content_type == "application/json":
+            message = json.loads(response.read().decode("utf-8"))
+            return self._rpc_result(message, request_id)
+        if content_type != "text/event-stream":
+            raise ToolError("Unsupported device MCP response Content-Type")
+
+        data = []
+        for index, raw_line in enumerate(response):
+            if time.monotonic() > deadline:
+                raise ToolError("Device MCP response timed out")
+            line = raw_line.decode("utf-8-sig" if index == 0 else "utf-8").rstrip("\r\n")
+            if not line:
+                if data:
+                    message = json.loads("\n".join(data))
+                    data = []
+                    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+                        raise ToolError("Invalid device MCP SSE message")
+                    if type(message.get("id")) is int and message["id"] == request_id:
+                        return self._rpc_result(message, request_id)
+                continue
+            field, separator, value = line.partition(":")
+            if separator and field == "data":
+                data.append(value[1:] if value.startswith(" ") else value)
+        raise ToolError("Device MCP SSE stream ended without a matching response")
+
+    def _post(self, method, params=None, timeout=30, notification=False):
+        body = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            body["params"] = params
+        if not notification:
+            body["id"] = next(self.request_ids)
+        headers = {"Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream",
+                   "Authorization": "Bearer " + self.api_key,
+                   "MCP-Protocol-Version": self.PROTOCOL_VERSION}
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        request = urllib.request.Request(
+            self.url, data=json.dumps(body).encode("utf-8"), method="POST", headers=headers)
+        deadline = time.monotonic() + timeout
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                if notification:
+                    if response.status != 202:
+                        raise ToolError("Device MCP did not accept initialization notification")
+                    return None
+                if response.status != 200:
+                    raise ToolError("Unexpected device MCP HTTP status {}".format(response.status))
+                result = self._read_response(response, body["id"], deadline)
+                if method == "initialize":
+                    self.session_id = response.headers.get("Mcp-Session-Id")
+                return result
+        except urllib.error.HTTPError as error:
+            error.close()
+            raise ToolError("Device MCP HTTP {}; check the API key, endpoint and MCP setting".format(
+                error.code)) from error
+        except urllib.error.URLError as error:
+            raise ToolError("Device MCP connection failed; check PICOKVM_MCP_URL and device availability") from error
+        except (HTTPException, OSError) as error:
+            raise ToolError("Device MCP request failed or timed out") from error
+        except (ValueError, UnicodeError) as error:
+            raise ToolError("Invalid device MCP response") from error
+
+    @staticmethod
+    def _validate_capture(result):
+        if (not isinstance(result, dict) or not isinstance(result.get("content"), list)
+                or not result["content"]
+                or type(result.get("isError", False)) is not bool):
+            raise ToolError("Invalid device MCP screenshot result")
+        has_image = False
+        for item in result["content"]:
+            if not isinstance(item, dict):
+                raise ToolError("Invalid device MCP screenshot content")
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                continue
+            if item.get("type") != "image" or item.get("mimeType") != "image/jpeg":
+                raise ToolError("Device MCP screenshot must contain JPEG image content")
+            try:
+                data = base64.b64decode(item.get("data", ""), validate=True)
+            except (TypeError, ValueError, binascii.Error) as error:
+                raise ToolError("Invalid device MCP screenshot Base64") from error
+            # Check JPEG framing without adding an image decoder dependency.
+            if not data.startswith(b"\xff\xd8\xff") or not data.endswith(b"\xff\xd9"):
+                raise ToolError("Device MCP screenshot contains empty or invalid JPEG data")
+            has_image = True
+        if not result.get("isError") and not has_image:
+            raise ToolError("Device MCP screenshot returned no image")
+        return {key: result[key] for key in ("content", "isError") if key in result}
+
+    def capture_screenshot(self, timeout_ms=5000):
+        with self.lock:
+            self._configure()
+            try:
+                if not self.initialized:
+                    result = self._post("initialize", {
+                        "protocolVersion": self.PROTOCOL_VERSION, "capabilities": {},
+                        "clientInfo": {"name": "picokvm-mcp-bridge", "version": "1.0.0"}})
+                    if (not isinstance(result, dict)
+                            or result.get("protocolVersion") != self.PROTOCOL_VERSION
+                            or not isinstance(result.get("capabilities"), dict)
+                            or "tools" not in result["capabilities"]):
+                        raise ToolError("Device MCP does not support the required protocol and tools")
+                    self._post("notifications/initialized", notification=True)
+                    self.initialized = True
+                result = self._post("tools/call", {
+                    "name": "capture_screenshot", "arguments": {"timeoutMs": timeout_ms}},
+                    timeout=timeout_ms / 1000 + 5)
+                return self._validate_capture(result)
+            except ToolError:
+                # A later caller may reconnect, but never replay this capture.
+                self.initialized = False
+                self.session_id = None
+                raise
+
+
 # Mirror kvm/cli.go and kvm/input_actions.go; no Go source is needed at runtime.
 KEY_CODES = {chr(ord("a") + i): 0x04 + i for i in range(26)}
 KEY_CODES.update({char: 0x1E + i for i, char in enumerate("1234567890")})
@@ -327,8 +561,10 @@ def parse_keys(names):
 
 
 class MCPBridge:
-    def __init__(self, client=None):
+    def __init__(self, client=None, mcp_client=None):
         self.client = client if client is not None else PicoKVMClient()
+        self.mcp_client = mcp_client if mcp_client is not None else PicoKVMMCPClient(
+            base_url=self.client.base_url)
 
     def autoset_edid(self):
         setting = os.environ.get("EDID_AUTOSET", "1").strip().lower()
@@ -346,9 +582,14 @@ class MCPBridge:
             validate(arguments, TOOL_BY_NAME[name]["inputSchema"])
             with INPUT_LOCK if name in INPUT_TOOLS else nullcontext():
                 result = getattr(self, name)(**arguments)
+            if name == "kvm_capture_screenshot":
+                return result
             return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
         except (ToolError, OSError, ValueError) as error:
             return {"content": [{"type": "text", "text": str(error)}], "isError": True}
+
+    def kvm_capture_screenshot(self, timeout_ms=5000):
+        return self.mcp_client.capture_screenshot(timeout_ms)
 
     def _absolute_position(self, x, y):
         state = self.client.rpc("getVideoState")
@@ -438,10 +679,36 @@ class MCPBridge:
     def kvm_get_status(self):
         return {"video": self.client.rpc("getVideoState"), "usb": self.client.rpc("getUSBState")}
 
+    def _collect_status(self, fields):
+        data, errors = {}, {}
+        for key, method in fields:
+            try:
+                data[key] = self.client.rpc(method)
+            except (ToolError, OSError, ValueError) as error:
+                errors[key] = str(error)
+        result = {"data": data, "errors": errors, "complete": not errors}
+        if not data:
+            # invoke preserves this JSON text and marks the MCP result as an error.
+            raise ToolError(json.dumps(result, ensure_ascii=False))
+        return result
+
+    def kvm_get_diagnostics(self):
+        return self._collect_status(DIAGNOSTIC_FIELDS)
+
+    def kvm_get_storage_status(self):
+        return self._collect_status(STORAGE_STATUS_FIELDS)
+
+    def kvm_reset_edid(self):
+        self.client.rpc("setEDID", {"edid": ""})
+        return {"success": True, "edid_set": True,
+                "message": "Default EDID configured; the target OS may need to re-detect the display. "
+                           "Use kvm_get_status to check the actual video input resolution. "
+                           "Set EDID_AUTOSET=0 to keep the default across bridge restarts."}
+
     def kvm_set_screen_resolution(self, width, height, refresh_rate=60):
         if (width, height, refresh_rate) not in EDID_TIMINGS:
             raise ToolError("Unsupported EDID mode; use 640x480, 800x600, 1024x768, "
-                            "1280x720, 1280x1024 or 1920x1080 at 60Hz")
+                            "1280x720, 1280x1024 or 1920x1080 at 60, 50 or 30Hz")
         template = self.client.rpc("getDefaultEDID")
         edid = resolution_edid(template, width, height, refresh_rate)
         self.client.rpc("setEDID", {"edid": edid})
@@ -453,10 +720,14 @@ class MCPBridge:
     def kvm_list_storage_files(self, source="storage"):
         return self.client.rpc("listStorageFiles" if source == "storage" else "listSDStorageFiles")
 
+    def kvm_delete_storage_file(self, filename, source="storage"):
+        validate_storage_filename(filename)
+        self.client.rpc("deleteStorageFile" if source == "storage" else "deleteSDStorageFile",
+                        {"filename": filename})
+        return {"success": True, "filename": filename, "source": source}
+
     def kvm_mount_iso(self, filename, source="storage"):
-        if (filename in (".", "..") or ".." in filename or "/" in filename
-                or "\\" in filename or "\x00" in filename):
-            raise ToolError("filename must be a storage file name, without path components")
+        validate_storage_filename(filename)
         self.client.rpc("mountWithStorage" if source == "storage" else "mountWithSDStorage",
                         {"filename": filename, "mode": "CDROM"})
         return {"success": True, "filename": filename, "source": source}

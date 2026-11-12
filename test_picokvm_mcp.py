@@ -1,5 +1,7 @@
 """Offline protocol and HID report tests; no PicoKVM or listening sockets needed."""
 
+import base64
+import copy
 from email.message import Message
 from http.client import IncompleteRead, RemoteDisconnected
 import importlib.util
@@ -10,7 +12,7 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 import urllib.error
 import urllib.request
 import urllib.response
@@ -41,6 +43,23 @@ class EDIDTests(unittest.TestCase):
         self.client.rpc.side_effect = lambda method, *args: DEFAULT_EDID if method == "getDefaultEDID" else None
         self.bridge = bridge_module.MCPBridge(self.client)
 
+    def test_reset_edid_uses_firmware_default_without_reading_template(self):
+        response = self.bridge.invoke("kvm_reset_edid", {})
+        self.assertNotIn("isError", response)
+        self.client.rpc.assert_called_once_with("setEDID", {"edid": ""})
+        result = json.loads(response["content"][0]["text"])
+        self.assertTrue(result["success"])
+        self.assertTrue(result["edid_set"])
+        self.assertIn("target OS", result["message"])
+        self.assertIn("EDID_AUTOSET=0", result["message"])
+
+    def test_reset_edid_failure_is_reported_without_retry(self):
+        self.client.rpc.side_effect = bridge_module.ToolError("restore failed")
+        response = self.bridge.invoke("kvm_reset_edid", {})
+        self.assertTrue(response["isError"])
+        self.assertIn("restore failed", response["content"][0]["text"])
+        self.client.rpc.assert_called_once_with("setEDID", {"edid": ""})
+
     def set_resolution(self, width=1024, height=768, refresh_rate=60):
         result = self.bridge.invoke("kvm_set_screen_resolution", {
             "width": width, "height": height, "refresh_rate": refresh_rate})
@@ -66,21 +85,44 @@ class EDIDTests(unittest.TestCase):
         self.assertIn("target OS", result["message"])
 
     def test_all_supported_modes_decode_to_requested_dimensions(self):
-        for width, height in [(640, 480), (800, 600), (1024, 768),
-                              (1280, 720), (1280, 1024), (1920, 1080)]:
-            with self.subTest(width=width, height=height):
+        for refresh_rate in (60, 50, 30):
+            for width, height in [(640, 480), (800, 600), (1024, 768),
+                                  (1280, 720), (1280, 1024), (1920, 1080)]:
+                with self.subTest(width=width, height=height, refresh_rate=refresh_rate):
+                    self.client.reset_mock()
+                    edid, result = self.set_resolution(width, height, refresh_rate)
+                    dtd = edid[54:72]
+                    active_x = dtd[2] | (dtd[4] & 0xF0) << 4
+                    active_y = dtd[5] | (dtd[7] & 0xF0) << 4
+                    blank_x = dtd[3] | (dtd[4] & 15) << 8
+                    blank_y = dtd[6] | (dtd[7] & 15) << 8
+                    rate = int.from_bytes(dtd[:2], "little") * 10000 / ((active_x + blank_x) * (active_y + blank_y))
+                    self.assertEqual((active_x, active_y), (width, height))
+                    self.assertAlmostEqual(rate, refresh_rate, delta=0.4)
+                    self.assertEqual(result["refresh_rate"], refresh_rate)
+                    self.assertEqual(sum(edid[:128]) % 256, 0)
+                    self.assertEqual(sum(edid[128:]) % 256, 0)
+
+    def test_cta_50_and_30hz_timings(self):
+        for width, height, refresh_rate, clock, blank_x, sync_offset in [
+                (1280, 720, 50, 74250000, 700, 440),
+                (1920, 1080, 50, 148500000, 720, 528),
+                (1920, 1080, 30, 74250000, 280, 88)]:
+            with self.subTest(width=width, height=height, refresh_rate=refresh_rate):
                 self.client.reset_mock()
-                edid, _ = self.set_resolution(width, height)
+                edid, _ = self.set_resolution(width, height, refresh_rate)
                 dtd = edid[54:72]
-                active_x = dtd[2] | (dtd[4] & 0xF0) << 4
-                active_y = dtd[5] | (dtd[7] & 0xF0) << 4
-                blank_x = dtd[3] | (dtd[4] & 15) << 8
-                blank_y = dtd[6] | (dtd[7] & 15) << 8
-                rate = int.from_bytes(dtd[:2], "little") * 10000 / ((active_x + blank_x) * (active_y + blank_y))
-                self.assertEqual((active_x, active_y), (width, height))
-                self.assertAlmostEqual(rate, 60, delta=0.4)
-                self.assertEqual(sum(edid[:128]) % 256, 0)
-                self.assertEqual(sum(edid[128:]) % 256, 0)
+                self.assertEqual(int.from_bytes(dtd[:2], "little") * 10000, clock)
+                self.assertEqual(dtd[3] | (dtd[4] & 15) << 8, blank_x)
+                self.assertEqual(dtd[8] | (dtd[11] >> 6) << 8, sync_offset)
+
+    def test_omitted_refresh_rate_defaults_to_60hz(self):
+        response = self.bridge.invoke("kvm_set_screen_resolution", {"width": 1024, "height": 768})
+        self.assertNotIn("isError", response)
+        result = json.loads(response["content"][0]["text"])
+        self.assertEqual(result["refresh_rate"], 60)
+        edid = bytes.fromhex(self.client.rpc.call_args[0][1]["edid"])
+        self.assertEqual(edid[54:66].hex(), "641900404100263018883600")
 
     def test_other_modes_removed_and_audio_preserved(self):
         edid, _ = self.set_resolution()
@@ -94,6 +136,10 @@ class EDIDTests(unittest.TestCase):
 
     def test_unsupported_modes_fail_without_rpc(self):
         for args in [{"width": 1024, "height": 720}, {"width": 1024, "height": 768, "refresh_rate": 75},
+                     {"width": 1024, "height": 768, "refresh_rate": 31},
+                     {"width": 1024, "height": 768, "refresh_rate": 59},
+                     {"width": 1024, "height": 768, "refresh_rate": 50.0},
+                     {"width": 1024, "height": 768, "refresh_rate": True},
                      {"width": True, "height": 768}, {"width": 1024},
                      {"width": 1920, "height": 1200}, {"width": 1024.0, "height": 768}]:
             with self.subTest(args=args):
@@ -377,43 +423,189 @@ class ToolTests(unittest.TestCase):
                 self.assertEqual(self.reports(), [(listing, {}),
                     (mount, {"filename": "test.iso", "mode": "CDROM"}), ("unmountImage", {})])
 
+    def test_delete_storage_file_routes_one_file_without_unmounting(self):
+        for args, method, source in [({}, "deleteStorageFile", "storage"),
+                                     ({"source": "storage"}, "deleteStorageFile", "storage"),
+                                     ({"source": "sd"}, "deleteSDStorageFile", "sd")]:
+            for filename in ("test.iso", "test.iso.incomplete", "example.txt"):
+                with self.subTest(args=args, filename=filename):
+                    self.client.reset_mock()
+                    result = self.invoke("kvm_delete_storage_file", dict(args, filename=filename))
+                    self.assertEqual(result, {"success": True, "filename": filename, "source": source})
+                    self.assertEqual(self.reports(), [(method, {"filename": filename})])
+
+    def test_delete_invalid_arguments_are_rejected_before_network(self):
+        cases = [{}, {"filename": None}, {"filename": 1},
+                 {"filename": "test.iso", "source": "bad"},
+                 {"filename": "test.iso", "unknown": True}]
+        cases.extend({"filename": filename} for filename in
+                     ("", ".", "..", "../test.iso", "/test.iso", "dir/test.iso",
+                      "dir\\test.iso", "test\x00.iso", "test..iso"))
+        for args in cases:
+            with self.subTest(args=args):
+                self.error("kvm_delete_storage_file", args)
+                self.client.rpc.assert_not_called()
+
+    def test_delete_failure_is_reported_without_retry(self):
+        for source in ("storage", "sd"):
+            with self.subTest(source=source):
+                self.client.reset_mock()
+                self.client.rpc.side_effect = bridge_module.ToolError("file does not exist")
+                self.error("kvm_delete_storage_file", {"filename": "missing.iso", "source": source},
+                           "file does not exist")
+                self.assertEqual(self.client.rpc.call_count, 1)
+
     def test_input_calls_are_serialized_across_bridge_instances(self):
-        entered, unblock, second_started, second_entered = [threading.Event() for _ in range(4)]
-        first_client, second_client = Mock(), Mock()
+        for name, arguments in (("kvm_send_key", {"key": "b"}),
+                                ("kvm_set_screen_resolution", {"width": 1024, "height": 768}),
+                                ("kvm_reset_edid", {})):
+            with self.subTest(name=name):
+                entered, unblock, second_started, second_entered = [threading.Event() for _ in range(4)]
+                first_client, second_client = Mock(), Mock()
+                results = []
 
-        def first_rpc(*args):
-            entered.set()
-            if not unblock.wait(2):
-                raise bridge_module.ToolError("test timed out")
+                def first_rpc(*args):
+                    entered.set()
+                    if not unblock.wait(2):
+                        raise bridge_module.ToolError("test timed out")
 
-        first_client.rpc.side_effect = first_rpc
-        second_client.rpc.side_effect = lambda *args: second_entered.set()
-        first = threading.Thread(target=bridge_module.MCPBridge(first_client).invoke,
-                                 args=("kvm_send_key", {"key": "a"}))
+                def second_rpc(method, *args):
+                    second_entered.set()
+                    return DEFAULT_EDID if method == "getDefaultEDID" else None
 
-        def second_call():
-            second_started.set()
-            bridge_module.MCPBridge(second_client).invoke("kvm_send_key", {"key": "b"})
+                first_client.rpc.side_effect = first_rpc
+                second_client.rpc.side_effect = second_rpc
+                first = threading.Thread(target=bridge_module.MCPBridge(first_client).invoke,
+                                         args=("kvm_send_key", {"key": "a"}))
 
-        second = threading.Thread(target=second_call)
-        first.start()
-        try:
-            self.assertTrue(entered.wait(2))
-            second.start()
-            self.assertTrue(second_started.wait(2))
-            self.assertFalse(second_entered.wait(0.05))
-        finally:
-            unblock.set()
-            first.join(2)
-            if second.ident is not None:
-                second.join(2)
-        self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
-        self.assertTrue(second_entered.is_set())
+                def second_call():
+                    second_started.set()
+                    results.append(bridge_module.MCPBridge(second_client).invoke(name, arguments))
+
+                second = threading.Thread(target=second_call)
+                first.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    second.start()
+                    self.assertTrue(second_started.wait(2))
+                    self.assertFalse(second_entered.wait(0.05))
+                finally:
+                    unblock.set()
+                    first.join(2)
+                    if second.ident is not None:
+                        second.join(2)
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertTrue(second_entered.is_set())
+                self.assertEqual(len(results), 1)
+                self.assertNotIn("isError", results[0])
+
+
+class StatusCollectionTests(unittest.TestCase):
+    def setUp(self):
+        self.values = {
+            "getDeviceID": "pico-test",
+            "getLocalUpdateStatus": {"appVersion": "0.1.5", "systemVersion": "1.0.0"},
+            "getNetworkState": {"interface_name": "eth0", "ipv4": "192.0.2.1"},
+            "getVideoState": {"ready": True, "width": 1920, "height": 1080, "frame_per_second": 60},
+            "getUSBState": "configured",
+            "getEDID": DEFAULT_EDID,
+            "getVirtualMediaState": {"source": "Storage", "mode": "CDROM", "filename": "test.iso", "size": 4096},
+            "getStorageSpace": {"bytesUsed": 4096, "bytesFree": 8192},
+        }
+        self.expected = dict(zip(
+            ("device_id", "version", "network", "video", "usb", "edid", "virtual_media", "storage"),
+            self.values.values()))
+        self.client = Mock()
+        self.client.rpc.side_effect = self.read
+        self.mcp_client = Mock()
+        self.bridge = bridge_module.MCPBridge(self.client, self.mcp_client)
+
+    def read(self, method):
+        value = self.values[method]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def result(self, tool):
+        response = self.bridge.invoke(tool, {})
+        return response, json.loads(response["content"][0]["text"])
+
+    def test_diagnostics_collects_basic_information_in_order_without_other_apis(self):
+        response, result = self.result("kvm_get_diagnostics")
+        self.assertNotIn("isError", response)
+        self.assertEqual(result, {"data": self.expected, "errors": {}, "complete": True})
+        self.assertEqual(self.client.rpc.call_args_list,
+                         [call(method) for method in self.values])
+        self.assertEqual(self.mcp_client.mock_calls, [])
+
+    def test_storage_status_collects_only_current_medium_and_internal_capacity(self):
+        response, result = self.result("kvm_get_storage_status")
+        self.assertNotIn("isError", response)
+        self.assertEqual(result, {"data": {key: self.expected[key] for key in ("virtual_media", "storage")},
+                                  "errors": {}, "complete": True})
+        self.assertEqual(self.client.rpc.call_args_list,
+                         [call("getVirtualMediaState"), call("getStorageSpace")])
+
+    def test_unmounted_medium_and_zero_capacity_are_successful_values(self):
+        self.values["getVirtualMediaState"] = None
+        self.values["getStorageSpace"] = {"bytesUsed": 0, "bytesFree": 0}
+        response, result = self.result("kvm_get_storage_status")
+        self.assertNotIn("isError", response)
+        self.assertEqual(result, {"data": {"virtual_media": None, "storage": {"bytesUsed": 0, "bytesFree": 0}},
+                                  "errors": {}, "complete": True})
+
+    def test_diagnostics_preserves_partial_results_and_continues_after_each_failure(self):
+        for method, key in zip(self.values, self.expected):
+            with self.subTest(method=method):
+                original = self.values[method]
+                self.values[method] = bridge_module.ToolError("unsupported method")
+                self.client.rpc.reset_mock()
+                response, result = self.result("kvm_get_diagnostics")
+                self.values[method] = original
+                self.assertNotIn("isError", response)
+                self.assertEqual(result, {
+                    "data": {name: value for name, value in self.expected.items() if name != key},
+                    "errors": {key: "unsupported method"}, "complete": False})
+                self.assertEqual(self.client.rpc.call_args_list,
+                                 [call(name) for name in self.values])
+
+    def test_storage_partial_failure_does_not_discard_null_success(self):
+        for error in (bridge_module.ToolError("unavailable"), OSError("unavailable"), ValueError("unavailable")):
+            with self.subTest(error=type(error)):
+                self.values["getVirtualMediaState"] = None
+                self.values["getStorageSpace"] = error
+                response, result = self.result("kvm_get_storage_status")
+                self.assertNotIn("isError", response)
+                self.assertEqual(result, {"data": {"virtual_media": None},
+                                          "errors": {"storage": "unavailable"}, "complete": False})
+
+    def test_all_failures_keep_json_details_and_mark_mcp_error_without_retries(self):
+        self.client.rpc.side_effect = bridge_module.ToolError("offline")
+        for tool, keys, methods in (
+                ("kvm_get_diagnostics", list(self.expected), list(self.values)),
+                ("kvm_get_storage_status", ["virtual_media", "storage"],
+                 ["getVirtualMediaState", "getStorageSpace"])):
+            with self.subTest(tool=tool):
+                self.client.rpc.reset_mock()
+                response, result = self.result(tool)
+                self.assertTrue(response["isError"])
+                self.assertEqual(result, {"data": {}, "errors": {key: "offline" for key in keys}, "complete": False})
+                self.assertEqual(self.client.rpc.call_args_list,
+                                 [call(method) for method in methods])
+
+    def test_new_tools_reject_arguments_before_contacting_device(self):
+        for tool in ("kvm_reset_edid", "kvm_get_diagnostics", "kvm_get_storage_status"):
+            for arguments in (None, [], {"source": "sd"}, {"unknown": True}):
+                with self.subTest(tool=tool, arguments=arguments):
+                    self.assertTrue(self.bridge.invoke(tool, arguments)["isError"])
+        self.client.rpc.assert_not_called()
 
 
 class FakeHTTPHandler(urllib.request.HTTPHandler):
     """Keep urllib's CookieJar and status processing, replacing only network I/O."""
+    handler_order = 100
+
     def __init__(self, responder):
         super().__init__()
         self.responder = responder
@@ -429,6 +621,8 @@ class FakeHTTPHandler(urllib.request.HTTPHandler):
         response = urllib.response.addinfourl(io.BytesIO(body), info, request.full_url, code)
         response.msg = "OK" if code == 200 else "Error"
         return response
+
+    https_open = http_open
 
 
 class ClientTests(unittest.TestCase):
@@ -563,6 +757,325 @@ class ClientTests(unittest.TestCase):
                 client.opener.open.assert_called_once()
 
 
+JPEG_BASE64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
+    "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIy"
+    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIA"
+    "AhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEB"
+    "AAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AJ/AB//Z"
+)
+
+SCREENSHOT_RESULT = {"content": [
+    {"type": "text", "text": "JPEG screenshot: 1x1, saved to /userdata/picokvm/screenshot/test.jpg"},
+    {"type": "image", "mimeType": "image/jpeg", "data": JPEG_BASE64},
+]}
+
+
+class MCPClientTests(unittest.TestCase):
+    @staticmethod
+    def success(request):
+        body = json.loads(request.data)
+        if body["method"] == "notifications/initialized":
+            return 202, b"", {}
+        result = ({"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                   "serverInfo": {"name": "picokvm-mcp", "version": "1.0.0"}}
+                  if body["method"] == "initialize" else copy.deepcopy(SCREENSHOT_RESULT))
+        return 200, {"jsonrpc": "2.0", "id": body["id"], "result": result}, {
+            "Content-Type": "application/json; charset=utf-8"}
+
+    def make_client(self, responder=None, **kwargs):
+        with patch.dict(os.environ, {}, clear=True):
+            client = bridge_module.PicoKVMMCPClient(**dict({"api_key": "device-secret"}, **kwargs))
+        handler = FakeHTTPHandler(responder or self.success)
+        client.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), bridge_module.NoMCPRedirect(), handler)
+        return client, handler.requests
+
+    def test_lazy_configuration_and_url_generation(self):
+        for base_url, expected in [
+                ("http://127.0.0.1", "http://127.0.0.1:8081/mcp"),
+                ("https://device.test:8443/prefix/", "http://device.test:8081/mcp"),
+                ("http://[2001:db8::1]:8080/", "http://[2001:db8::1]:8081/mcp")]:
+            with self.subTest(base_url=base_url):
+                client, requests = self.make_client(base_url=base_url)
+                self.assertIsNone(client.url)
+                self.assertEqual(client.capture_screenshot(), SCREENSHOT_RESULT)
+                self.assertEqual({request.full_url for request in requests}, {expected})
+
+    def test_environment_and_explicit_url(self):
+        endpoint = "https://proxy.test/custom/mcp?device=one"
+        with patch.dict(os.environ, {"PICOKVM_BASE_URL": "http://device.test",
+                                    "PICOKVM_MCP_URL": endpoint,
+                                    "PICOKVM_MCP_API_KEY": "environment-key"}, clear=True):
+            client = bridge_module.PicoKVMMCPClient()
+        self.assertEqual(client.base_url, "http://device.test")
+        self.assertEqual(client.url, endpoint)
+        self.assertEqual(client.api_key, "environment-key")
+        client, requests = self.make_client(base_url="invalid", url=endpoint)
+        client.capture_screenshot()
+        self.assertEqual({request.full_url for request in requests}, {endpoint})
+
+    def test_invalid_configuration_is_rejected_before_network(self):
+        for kwargs in [{"api_key": ""}, {"api_key": "two words"}, {"api_key": "bad\r\nkey"},
+                       {"base_url": "invalid"}, {"base_url": "http://[invalid"},
+                       {"url": ""}, {"url": "/mcp"}, {"url": "ftp://device.test/mcp"},
+                       {"url": "http://user:password@device.test/mcp"},
+                       {"url": "http://device.test:99999/mcp"},
+                       {"url": "http://device.test/mcp#fragment"},
+                       {"url": "http://device.test/ bad"}]:
+            with self.subTest(kwargs=kwargs):
+                client, requests = self.make_client(**kwargs)
+                with self.assertRaises(bridge_module.ToolError):
+                    client.capture_screenshot()
+                self.assertEqual(requests, [])
+
+    def test_handshake_authentication_ids_and_timeout(self):
+        client, requests = self.make_client()
+        client.opener.open = Mock(wraps=client.opener.open)
+        self.assertEqual(client.capture_screenshot(), SCREENSHOT_RESULT)
+        self.assertEqual(client.capture_screenshot(30000), SCREENSHOT_RESULT)
+        bodies = [json.loads(request.data) for request in requests]
+        self.assertEqual([body["method"] for body in bodies], [
+            "initialize", "notifications/initialized", "tools/call", "tools/call"])
+        self.assertEqual(bodies[0]["params"], {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "picokvm-mcp-bridge", "version": "1.0.0"}})
+        self.assertNotIn("id", bodies[1])
+        self.assertEqual([bodies[i]["id"] for i in (0, 2, 3)], [1, 2, 3])
+        self.assertEqual(bodies[2]["params"], {
+            "name": "capture_screenshot", "arguments": {"timeoutMs": 5000}})
+        self.assertEqual(bodies[3]["params"]["arguments"], {"timeoutMs": 30000})
+        self.assertEqual([call[1]["timeout"] for call in client.opener.open.call_args_list],
+                         [30, 30, 10, 35])
+        for request in requests:
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(request.get_header("Authorization"), "Bearer device-secret")
+            self.assertEqual(request.get_header("Accept"), "application/json, text/event-stream")
+            self.assertEqual(request.get_header("Mcp-protocol-version"), "2025-03-26")
+            self.assertIsNone(request.get_header("Cookie"))
+            self.assertIsNone(request.get_header("X-session-id"))
+
+    def test_optional_session_header_is_forwarded(self):
+        def responder(request):
+            status, body, headers = self.success(request)
+            if json.loads(request.data)["method"] == "initialize":
+                headers["Mcp-Session-Id"] = "test-session"
+            else:
+                self.assertEqual(request.get_header("Mcp-session-id"), "test-session")
+            return status, body, headers
+        client, _ = self.make_client(responder)
+        client.capture_screenshot()
+        client.capture_screenshot()
+
+    def test_sse_comments_notifications_multiple_data_lines_and_early_stop(self):
+        def responder(request):
+            status, body, headers = self.success(request)
+            if status == 202:
+                return status, body, headers
+            event = json.dumps(body, indent=2)
+            payload = (": heartbeat\r\n\r\n"
+                       "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\n\r\n"
+                       "data: {\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{}}\r\n\r\n"
+                       "event: message\r\n" +
+                       "\r\n".join("data: " + line for line in event.splitlines()) +
+                       "\r\n\r\ndata: malformed trailing event\r\n\r\n")
+            return 200, payload.encode(), {"Content-Type": "text/event-stream; charset=utf-8"}
+        client, requests = self.make_client(responder)
+        self.assertEqual(client.capture_screenshot(), SCREENSHOT_RESULT)
+        self.assertEqual(len(requests), 3)
+
+    def test_invalid_json_sse_and_rpc_responses(self):
+        for payload, content_type in [
+                (b"not JSON", "application/json"), (b"\xff", "application/json"),
+                ([], "application/json"), ({"jsonrpc": "2.0", "id": 999, "result": {}}, "application/json"),
+                ({"jsonrpc": "2.0", "id": True, "result": {}}, "application/json"),
+                ({"id": 1, "result": {}}, "application/json"),
+                ({"jsonrpc": "2.0", "id": 1}, "application/json"),
+                ({"jsonrpc": "2.0", "id": 1, "result": {}, "error": {}}, "application/json"),
+                ({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601}}, "application/json"),
+                ({"jsonrpc": "2.0", "id": 1, "error": None}, "application/json"),
+                (b"data: {}\n\n", "text/event-stream"),
+                (b"data: broken\n\n", "text/event-stream"),
+                (b"data: {\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{}}\n\n", "text/event-stream"),
+                (b": heartbeat\n\n", "text/event-stream"), (b"<html/>", "text/html")]:
+            with self.subTest(payload=payload):
+                client, requests = self.make_client(lambda request: (
+                    200, payload, {"Content-Type": content_type}))
+                with self.assertRaises(bridge_module.ToolError):
+                    client.capture_screenshot()
+                self.assertEqual(len(requests), 1)
+
+    def test_sse_utf8_bom_and_timeout_while_receiving_heartbeats(self):
+        def responder(request):
+            status, body, headers = self.success(request)
+            if status == 202:
+                return status, body, headers
+            return 200, ("\ufeffdata: " + json.dumps(body) + "\n\n").encode(), {
+                "Content-Type": "text/event-stream"}
+        client, _ = self.make_client(responder)
+        self.assertEqual(client.capture_screenshot(), SCREENSHOT_RESULT)
+
+        client, requests = self.make_client(lambda request: (
+            200, b": heartbeat\n\n", {"Content-Type": "text/event-stream"}))
+        client.initialized = True
+        with patch.object(bridge_module.time, "monotonic", side_effect=[0, 11]):
+            with self.assertRaisesRegex(bridge_module.ToolError, "timed out"):
+                client.capture_screenshot()
+        self.assertEqual(len(requests), 1)
+
+    def test_initialization_failure_prevents_capture(self):
+        for result in [None, {}, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}},
+                       {"protocolVersion": "2025-03-26", "capabilities": {}}]:
+            with self.subTest(result=result):
+                def responder(request):
+                    return 200, {"jsonrpc": "2.0", "id": 1, "result": result}, {
+                        "Content-Type": "application/json"}
+                client, requests = self.make_client(responder)
+                with self.assertRaises(bridge_module.ToolError):
+                    client.capture_screenshot()
+                self.assertEqual(len(requests), 1)
+        def reject_notification(request):
+            if json.loads(request.data)["method"] == "notifications/initialized":
+                return 200, b"", {}
+            return self.success(request)
+        client, requests = self.make_client(reject_notification)
+        with self.assertRaises(bridge_module.ToolError):
+            client.capture_screenshot()
+        self.assertEqual(len(requests), 2)
+
+    def test_http_errors_do_not_replay_capture_or_echo_body(self):
+        for status in [202, 301, 302, 307, 308, 401, 403, 404, 405, 500, 503]:
+            with self.subTest(status=status):
+                def responder(request):
+                    if json.loads(request.data)["method"] == "tools/call":
+                        return status, b"device-secret " + JPEG_BASE64.encode(), {
+                            "Location": "http://elsewhere.test/mcp"}
+                    return self.success(request)
+                client, requests = self.make_client(responder)
+                with self.assertRaises(bridge_module.ToolError) as caught:
+                    client.capture_screenshot()
+                self.assertNotIn("device-secret", str(caught.exception))
+                self.assertNotIn(JPEG_BASE64, str(caught.exception))
+                self.assertEqual(len(requests), 3)
+                self.assertFalse(client.initialized)
+
+    def test_transport_failures_do_not_retry_and_next_call_can_reconnect(self):
+        for error in [urllib.error.URLError("offline"), TimeoutError("timed out"),
+                      IncompleteRead(b"partial", 100), RemoteDisconnected("disconnected")]:
+            with self.subTest(error=error):
+                client, requests = self.make_client()
+                real_open = client.opener.open
+                def fail_capture(request, **kwargs):
+                    if json.loads(request.data)["method"] == "tools/call":
+                        raise error
+                    return real_open(request, **kwargs)
+                client.opener.open = Mock(side_effect=fail_capture)
+                with self.assertRaises(bridge_module.ToolError):
+                    client.capture_screenshot()
+                self.assertEqual(client.opener.open.call_count, 3)
+                client.opener.open = real_open
+                self.assertEqual(client.capture_screenshot(), SCREENSHOT_RESULT)
+                self.assertEqual([json.loads(request.data)["method"] for request in requests], [
+                    "initialize", "notifications/initialized", "initialize", "notifications/initialized", "tools/call"])
+
+    def test_tool_errors_are_preserved_without_requiring_image(self):
+        result = {"content": [{"type": "text", "text": "screenshot timed out after 5000ms"}], "isError": True}
+        def responder(request):
+            status, body, headers = self.success(request)
+            if json.loads(request.data)["method"] == "tools/call":
+                body["result"] = result
+            return status, body, headers
+        client, requests = self.make_client(responder)
+        self.assertEqual(client.capture_screenshot(), result)
+        self.assertEqual(len(requests), 3)
+
+    def test_invalid_image_results_are_rejected(self):
+        for result in [None, [], {}, {"content": []}, {"content": "invalid"},
+                       {"content": [None]}, {"content": [{"type": "text", "text": "no image"}]},
+                       {"content": [{"type": "text", "text": 5}]},
+                       dict(SCREENSHOT_RESULT, isError="false")]:
+            with self.subTest(result=result):
+                with self.assertRaises(bridge_module.ToolError):
+                    bridge_module.PicoKVMMCPClient._validate_capture(result)
+        for changes in [{"type": "resource"}, {"mimeType": "image/png"}, {"data": ""},
+                        {"data": "not base64!"}, {"data": None}, {"data": []},
+                        {"data": "é"}, {"data": base64.b64encode(b"not JPEG").decode()},
+                        {"data": base64.b64encode(b"\xff\xd8\xfftruncated").decode()}]:
+            with self.subTest(changes=changes):
+                result = copy.deepcopy(SCREENSHOT_RESULT)
+                result["content"][1].update(changes)
+                with self.assertRaises(bridge_module.ToolError):
+                    bridge_module.PicoKVMMCPClient._validate_capture(result)
+
+    def test_captures_are_serialized_without_blocking_input(self):
+        entered, unblock, second_entered = [threading.Event() for _ in range(3)]
+        client, _ = self.make_client()
+        client.initialized = True
+        count = [0]
+        def capture(*args, **kwargs):
+            count[0] += 1
+            if count[0] == 1:
+                entered.set()
+                if not unblock.wait(2):
+                    raise bridge_module.ToolError("test timed out")
+            else:
+                second_entered.set()
+            return copy.deepcopy(SCREENSHOT_RESULT)
+        client._post = Mock(side_effect=capture)
+        web_client = Mock()
+        bridge = bridge_module.MCPBridge(web_client, client)
+        results = []
+        first = threading.Thread(target=lambda: results.append(bridge.invoke("kvm_capture_screenshot", {})))
+        second = threading.Thread(target=lambda: results.append(bridge.invoke("kvm_capture_screenshot", {})))
+        first.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            second.start()
+            self.assertFalse(second_entered.wait(0.05))
+            self.assertTrue(bridge_module.INPUT_LOCK.acquire(timeout=0.5))
+            bridge_module.INPUT_LOCK.release()
+            self.assertNotIn("isError", bridge.invoke("kvm_send_key", {"key": "a"}))
+        finally:
+            unblock.set()
+            first.join(2)
+            if second.ident is not None:
+                second.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(results, [SCREENSHOT_RESULT, SCREENSHOT_RESULT])
+
+
+class ScreenshotToolTests(unittest.TestCase):
+    def test_schema_defaults_and_validation_before_network(self):
+        mcp_client = Mock()
+        mcp_client.capture_screenshot.return_value = SCREENSHOT_RESULT
+        bridge = bridge_module.MCPBridge(Mock(), mcp_client)
+        self.assertEqual(bridge.invoke("kvm_capture_screenshot", {}), SCREENSHOT_RESULT)
+        mcp_client.capture_screenshot.assert_called_once_with(5000)
+        for args in [{"timeout_ms": 1000}, {"timeout_ms": 30000}]:
+            self.assertEqual(bridge.invoke("kvm_capture_screenshot", args), SCREENSHOT_RESULT)
+            mcp_client.capture_screenshot.assert_called_with(args["timeout_ms"])
+        mcp_client.reset_mock()
+        for args in [{"timeout_ms": 999}, {"timeout_ms": 30001}, {"timeout_ms": 5000.0},
+                     {"timeout_ms": True}, {"timeout_ms": "5000"}, {"timeoutMs": 5000}]:
+            with self.subTest(args=args):
+                self.assertTrue(bridge.invoke("kvm_capture_screenshot", args)["isError"])
+        mcp_client.capture_screenshot.assert_not_called()
+
+    def test_missing_key_only_affects_screenshots(self):
+        with patch.dict(os.environ, {}, clear=True):
+            web_client = Mock()
+            web_client.rpc.return_value = {"files": []}
+            bridge = bridge_module.MCPBridge(web_client)
+        result = bridge.invoke("kvm_capture_screenshot", {})
+        self.assertTrue(result["isError"])
+        self.assertIn("PICOKVM_MCP_API_KEY", result["content"][0]["text"])
+        web_client.rpc.assert_not_called()
+        result = bridge.invoke("kvm_list_storage_files", {})
+        self.assertNotIn("isError", result)
+        self.assertEqual(json.loads(result["content"][0]["text"]), {"files": []})
+
+
 class MemoryConnection:
     def __init__(self, request):
         self.input = io.BytesIO(request)
@@ -609,8 +1122,9 @@ class HandlerTests(unittest.TestCase):
         names = {tool["name"] for tool in self.rpc("tools/list")["result"]["tools"]}
         self.assertEqual(names, {"kvm_mouse_move", "kvm_mouse_click", "kvm_mouse_wheel", "kvm_send_key",
                                 "kvm_send_key_combination", "kvm_type_text", "kvm_get_status",
-                                "kvm_list_storage_files", "kvm_mount_iso", "kvm_unmount_iso",
-                                "kvm_set_screen_resolution"})
+                                "kvm_list_storage_files", "kvm_delete_storage_file", "kvm_mount_iso", "kvm_unmount_iso",
+                                "kvm_set_screen_resolution", "kvm_capture_screenshot",
+                                "kvm_reset_edid", "kvm_get_diagnostics", "kvm_get_storage_status"})
         self.assertEqual(self.rpc("ping")["result"], {})
         self.assertEqual(self.rpc("unknown")["error"]["code"], -32601)
 
@@ -628,6 +1142,39 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(headers["Content-Length"], "0")
         self.assertEqual(body, b"")
+
+    def test_screenshot_image_reaches_http_response_without_text_encoding(self):
+        mcp_client, requests = MCPClientTests().make_client()
+        self.server.bridge.mcp_client = mcp_client
+        result = self.rpc("tools/call", {"name": "kvm_capture_screenshot"})["result"]
+        self.assertEqual(result, SCREENSHOT_RESULT)
+        self.assertEqual(result["content"][1]["type"], "image")
+        self.assertEqual(base64.b64decode(result["content"][1]["data"]), base64.b64decode(JPEG_BASE64))
+        self.assertEqual(len(requests), 3)
+        self.client.rpc.assert_not_called()
+
+    def test_screenshot_failures_reach_http_response_and_leave_other_tools_usable(self):
+        for capture_result in [
+                {"content": [{"type": "text", "text": "no HDMI signal"}], "isError": True},
+                {"content": [{"type": "image", "mimeType": "image/jpeg", "data": "invalid"}]},
+                None]:
+            with self.subTest(capture_result=capture_result):
+                def responder(request):
+                    status, body, headers = MCPClientTests.success(request)
+                    if json.loads(request.data)["method"] == "tools/call":
+                        if capture_result is None:
+                            return 401, {"error": "unauthorized"}, headers
+                        body["result"] = capture_result
+                    return status, body, headers
+                mcp_client, requests = MCPClientTests().make_client(responder)
+                self.server.bridge.mcp_client = mcp_client
+                result = self.rpc("tools/call", {"name": "kvm_capture_screenshot"})["result"]
+                self.assertTrue(result["isError"])
+                if capture_result and capture_result.get("isError"):
+                    self.assertEqual(result, capture_result)
+                self.assertEqual(len(requests), 3)
+                existing = self.rpc("tools/call", {"name": "kvm_list_storage_files"})["result"]
+                self.assertEqual(json.loads(existing["content"][0]["text"]), {"files": []})
 
     def test_get_readme_independent_of_working_directory(self):
         expected = (ROOT / "README.md").read_bytes()
