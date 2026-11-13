@@ -212,8 +212,7 @@ TOOLS = [
              "refresh_rate": integer_schema(30, 60, enum=[60, 50, 30], default=60),
          }, ("width", "height")),
     tool("kvm_reset_edid", "Restore the firmware's default EDID. The target OS may need to "
-         "re-detect the display. Set EDID_AUTOSET=0 to keep the default across bridge restarts; "
-         "otherwise startup sets 1024x768 again."),
+         "re-detect the display."),
     tool("kvm_capture_screenshot", "Capture a JPEG image using the device MCP server. "
          "Requires PICOKVM_MCP_API_KEY and firmware supporting Streamable HTTP. "
          "The device also saves the screenshot locally.", {
@@ -569,7 +568,7 @@ class MCPBridge:
             base_url=self.client.base_url)
 
     def autoset_edid(self):
-        setting = os.environ.get("EDID_AUTOSET", "1").strip().lower()
+        setting = os.environ.get("EDID_AUTOSET", "0").strip().lower()
         if setting in ("0", "false", "no", "off"):
             return None
         if setting not in ("1", "true", "yes", "on"):
@@ -704,8 +703,7 @@ class MCPBridge:
         self.client.rpc("setEDID", {"edid": ""})
         return {"success": True, "edid_set": True,
                 "message": "Default EDID configured; the target OS may need to re-detect the display. "
-                           "Use kvm_get_status to check the actual video input resolution. "
-                           "Set EDID_AUTOSET=0 to keep the default across bridge restarts."}
+                           "Use kvm_get_status to check the actual video input resolution. "}
 
     def kvm_set_screen_resolution(self, width, height, refresh_rate=60):
         if (width, height, refresh_rate) not in EDID_TIMINGS:

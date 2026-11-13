@@ -104,8 +104,7 @@ python picokvm-download.py archive.zip
 
 auth and cors is not implemented by design.
 
-EDID is set on start to prefer 1024x768 @ 60Hz for compatibility.  
-Set `EDID_AUTOSET` env 0 to disable this function.
+Set `EDID_AUTOSET=1` to prefer 1024x768 @ 60Hz at mcp server startup.
 
 kvm_capture_screenshot saves captured screenshot files on PicoKVM.  
 you may need to delete that manually.

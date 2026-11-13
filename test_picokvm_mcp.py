@@ -175,19 +175,19 @@ class EDIDTests(unittest.TestCase):
                 self.assertTrue(result["isError"])
                 self.assertEqual(self.client.rpc.call_count, len(effects))
 
-    def test_autoset_defaults_on_and_accepts_explicit_enabled_values(self):
-        for setting in [None, "1", "true", "YES", " on "]:
+    def test_autoset_accepts_explicit_enabled_values(self):
+        for setting in ["1", "true", "YES", " on "]:
             with self.subTest(setting=setting):
                 self.client.reset_mock()
-                with patch.dict(os.environ, {} if setting is None else {"EDID_AUTOSET": setting}, clear=True):
+                with patch.dict(os.environ, {"EDID_AUTOSET": setting}, clear=True):
                     result = self.bridge.autoset_edid()
                 self.assertEqual((result["width"], result["height"], result["refresh_rate"]), (1024, 768, 60))
                 self.assertEqual(self.client.rpc.call_count, 2)
 
-    def test_autoset_disabled_does_not_contact_device(self):
-        for setting in ["0", "false", "NO", " off "]:
+    def test_autoset_defaults_off_and_disabled_does_not_contact_device(self):
+        for setting in [None, "0", "false", "NO", " off "]:
             with self.subTest(setting=setting):
-                with patch.dict(os.environ, {"EDID_AUTOSET": setting}):
+                with patch.dict(os.environ, {} if setting is None else {"EDID_AUTOSET": setting}, clear=True):
                     self.assertIsNone(self.bridge.autoset_edid())
                 self.client.rpc.assert_not_called()
         with patch.dict(os.environ, {"EDID_AUTOSET": "invalid"}):
@@ -200,7 +200,7 @@ class EDIDTests(unittest.TestCase):
         server.serve_forever.side_effect = KeyboardInterrupt
         with patch.object(bridge_module, "ThreadingHTTPServer", return_value=server), \
                 patch.object(bridge_module, "MCPBridge", return_value=self.bridge), \
-                patch.dict(os.environ, {}, clear=True), patch("sys.stdout", new_callable=io.StringIO):
+                patch.dict(os.environ, {"EDID_AUTOSET": "1"}, clear=True), patch("sys.stdout", new_callable=io.StringIO):
             server.serve_forever.side_effect = lambda: self.assertEqual(self.client.rpc.call_count, 2)
             bridge_module.run()
         self.assertEqual(self.client.rpc.call_count, 2)
@@ -212,7 +212,7 @@ class EDIDTests(unittest.TestCase):
         self.client.rpc.side_effect = bridge_module.ToolError("unavailable")
         with patch.object(bridge_module, "ThreadingHTTPServer", return_value=server), \
                 patch.object(bridge_module, "MCPBridge", return_value=self.bridge), \
-                patch.dict(os.environ, {}, clear=True), patch("sys.stdout", new_callable=io.StringIO), \
+                patch.dict(os.environ, {"EDID_AUTOSET": "1"}, clear=True), patch("sys.stdout", new_callable=io.StringIO), \
                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
             bridge_module.run()
         self.assertIn("EDID_AUTOSET failed", stderr.getvalue())

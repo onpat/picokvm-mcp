@@ -126,7 +126,7 @@ class StartupTests(unittest.TestCase):
         self.env_path.write_text(
             "PICOKVM_BASE_URL=http://from-dotenv\nPICOKVM_PASSWORD='test password'\n"
             "PICOKVM_MCP_URL=http://screenshot:8081/mcp\n"
-            "PICOKVM_MCP_API_KEY=test-key\nEDID_AUTOSET=0\n", encoding="utf-8")
+            "PICOKVM_MCP_API_KEY=test-key\n", encoding="utf-8")
         original_cwd = Path.cwd()
         os.chdir(self.cwd)
         self.addCleanup(os.chdir, original_cwd)
