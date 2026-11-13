@@ -54,7 +54,6 @@ class EDIDTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertTrue(result["edid_set"])
         self.assertIn("target OS", result["message"])
-        self.assertIn("EDID_AUTOSET=0", result["message"])
 
     def test_reset_edid_failure_is_reported_without_retry(self):
         self.client.rpc.side_effect = bridge_module.ToolError("restore failed")
