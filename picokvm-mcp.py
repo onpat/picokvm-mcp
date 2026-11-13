@@ -16,6 +16,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from picokvm_env import EnvError, load_env
+
 
 REPORT_GAP = 0.015
 INPUT_LOCK = threading.Lock()
@@ -802,6 +804,11 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
 
 
 def run(host="0.0.0.0", port=8000):
+    try:
+        load_env(Path(__file__).resolve().with_name(".env"))
+    except EnvError as error:
+        print("Configuration error: {}".format(error), file=sys.stderr)
+        return 1
     server = ThreadingHTTPServer((host, port), MCPBridgeHandler)
     server.bridge = MCPBridge()
     try:
@@ -819,4 +826,4 @@ def run(host="0.0.0.0", port=8000):
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(run())

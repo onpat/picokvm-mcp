@@ -58,6 +58,9 @@ class FakeClient:
 
 class UploadTests(unittest.TestCase):
     def setUp(self):
+        env_loader = patch.object(upload, "load_env")
+        env_loader.start()
+        self.addCleanup(env_loader.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "disc.iso"

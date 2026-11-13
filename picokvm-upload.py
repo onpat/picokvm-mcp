@@ -15,6 +15,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from picokvm_env import EnvError, load_env
+
 
 CHUNK_SIZE = 256 * 1024 * 1024
 READ_SIZE = 64 * 1024
@@ -228,6 +230,11 @@ def main(argv=None):
     parser.add_argument("--source", choices=("internal", "sd"), default="internal",
                         help="destination storage (default: internal)")
     args = parser.parse_args(argv)
+    try:
+        load_env(Path(__file__).resolve().with_name(".env"))
+    except EnvError as error:
+        print("Configuration error: {}".format(error), file=sys.stderr)
+        return 1
     base_url = os.environ.get("PICOKVM_BASE_URL", "").strip()
     if not base_url:
         parser.error("set PICOKVM_BASE_URL first, e.g. export PICOKVM_BASE_URL='http://192.168.1.100'")

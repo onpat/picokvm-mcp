@@ -39,6 +39,9 @@ DEFAULT_EDID = (
 
 class EDIDTests(unittest.TestCase):
     def setUp(self):
+        env_loader = patch.object(bridge_module, "load_env")
+        env_loader.start()
+        self.addCleanup(env_loader.stop)
         self.client = Mock()
         self.client.rpc.side_effect = lambda method, *args: DEFAULT_EDID if method == "getDefaultEDID" else None
         self.bridge = bridge_module.MCPBridge(self.client)

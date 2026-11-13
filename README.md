@@ -14,13 +14,14 @@ Python 3.7 or later
 ## run
 
 ```bash
-export PICOKVM_BASE_URL='http://192.168.1.100'
-# optional: for kvm_capture_screenshot
-export PICOKVM_MCP_API_KEY='your-device-mcp-api-key'
+cp .env.example .env
+# Edit .env before starting.
 python picokvm-mcp.py
 ```
 
-set PICOKVM_PASSWORD env if picokvm has password
+`picokvm-mcp.py`, `picokvm-upload.py` and `picokvm-download.py` automatically
+load `.env` from their own directory. Keep the shared `picokvm_env.py` module alongside them.
+Environmental value set in shell takes priority than `.env` values.
 
 ## supported actions
 
@@ -61,7 +62,7 @@ key names are: `Enter`, `Escape`, `Backspace`, `Tab`, `Space` ,`F1`-`F12`, `Dele
 
 - `kvm_capture_screenshot`: capture the current screen as a JPEG MCP image
   - screenshot retrieval is exposed by internal MCP server instead of usual JSON API, so  
-    enable the device MCP server and configure its API key in the device settings.
+    enable the device MCP server and get an API key in the device settings.
   - you can set PICOKVM_MCP_URL env to use mcp in other host than JSON API.
 
 ### status
@@ -90,20 +91,14 @@ File upload and download is not implemented by this MCP bridge; use `picokvm-upl
 those script supports large file (512MB+) but, SSH SCP transfer is more stable (if its possible) ...
 
 ```bash
-export PICOKVM_BASE_URL='http://192.168.1.100'
-# Only if the device requires a password:
-export PICOKVM_PASSWORD='your-password'
-
 python picokvm-upload.py archive.zip
 ```
 
 ```bash
-export PICOKVM_BASE_URL='http://192.168.1.100'
-# Only if the device requires a password:
-export PICOKVM_PASSWORD='your-password'
-
 python picokvm-download.py archive.zip
 ```
+
+`picokvm-upload.py` and `picokvm-download.py` uses the same .env as the MCP server.
 
 ## note
 

@@ -1,0 +1,5 @@
+# sample config for Codex VSCode extension.
+# run picokvm-mcp.py before sending a prompt.
+
+[mcp_servers.picokvm_mcp]
+url = "http://127.0.0.1:8000/mcp"

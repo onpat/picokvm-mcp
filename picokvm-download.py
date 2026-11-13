@@ -16,6 +16,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from picokvm_env import EnvError, load_env
+
 
 READ_SIZE = 64 * 1024
 TIMEOUT = 120
@@ -206,6 +208,11 @@ def main(argv=None):
                         help="source storage (default: internal)")
     parser.add_argument("--output", help="destination file path (default: same name in the current directory)")
     args = parser.parse_args(argv)
+    try:
+        load_env(Path(__file__).resolve().with_name(".env"))
+    except EnvError as error:
+        print("Configuration error: {}".format(error), file=sys.stderr)
+        return 1
     base_url = os.environ.get("PICOKVM_BASE_URL", "").strip()
     if not base_url:
         parser.error("set PICOKVM_BASE_URL first, e.g. export PICOKVM_BASE_URL='http://192.168.1.100'")

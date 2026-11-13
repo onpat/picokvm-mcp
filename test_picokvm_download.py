@@ -358,6 +358,11 @@ class HTTPTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def setUp(self):
+        env_loader = patch.object(download, "load_env")
+        env_loader.start()
+        self.addCleanup(env_loader.stop)
+
     def test_success_forwards_arguments_and_prints_saved_path(self):
         with patch.dict(os.environ, {"PICOKVM_BASE_URL": "http://device", "PICOKVM_PASSWORD": "secret"}), \
                 patch.object(download, "Client") as client, \
