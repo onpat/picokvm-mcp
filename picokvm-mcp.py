@@ -801,9 +801,20 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
         print("[{}] {}".format(self.log_date_time_string(), format % args))
 
 
-def run(host="0.0.0.0", port=8000):
+def run(host=None, port=None):
     try:
         load_env(Path(__file__).resolve().with_name(".env"))
+        if host is None:
+            host = os.environ.get("PICOKVM_MCP_HOST", "0.0.0.0").strip()
+            if not host:
+                raise EnvError("PICOKVM_MCP_HOST must not be empty")
+        if port is None:
+            try:
+                port = int(os.environ.get("PICOKVM_MCP_PORT", "8000"))
+            except ValueError:
+                raise EnvError("PICOKVM_MCP_PORT must be an integer from 1 to 65535") from None
+            if not 1 <= port <= 65535:
+                raise EnvError("PICOKVM_MCP_PORT must be an integer from 1 to 65535")
     except EnvError as error:
         print("Configuration error: {}".format(error), file=sys.stderr)
         return 1

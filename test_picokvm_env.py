@@ -168,6 +168,55 @@ class StartupTests(unittest.TestCase):
         server.serve_forever.assert_called_once()
         server.server_close.assert_called_once()
 
+    def test_mcp_listening_address_defaults_dotenv_and_overrides(self):
+        module = load_script("picokvm-mcp.py")
+        cases = (
+            ("", {}, {}, ("0.0.0.0", 8000)),
+            ("PICOKVM_MCP_HOST=127.0.0.1\nPICOKVM_MCP_PORT=9000\n",
+             {}, {}, ("127.0.0.1", 9000)),
+            ("PICOKVM_MCP_HOST=127.0.0.1\nPICOKVM_MCP_PORT=9000\n",
+             {"PICOKVM_MCP_HOST": "192.0.2.1", "PICOKVM_MCP_PORT": "9100"},
+             {}, ("192.0.2.1", 9100)),
+            ("", {"PICOKVM_MCP_PORT": "1"}, {}, ("0.0.0.0", 1)),
+            ("", {"PICOKVM_MCP_PORT": "65535"}, {}, ("0.0.0.0", 65535)),
+            ("PICOKVM_MCP_HOST=127.0.0.1\nPICOKVM_MCP_PORT=9000\n",
+             {"PICOKVM_MCP_HOST": "192.0.2.1", "PICOKVM_MCP_PORT": "9100"},
+             {"host": "127.0.0.2", "port": 9200}, ("127.0.0.2", 9200)),
+        )
+        for dotenv, environment, arguments, expected in cases:
+            with self.subTest(expected=expected), \
+                    patch.dict(os.environ, environment, clear=True), \
+                    patch.object(module, "__file__", str(self.scripts / "picokvm-mcp.py")), \
+                    patch.object(module, "ThreadingHTTPServer") as listen, \
+                    patch.object(module, "MCPBridge") as bridge, \
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.env_path.write_text(dotenv, encoding="utf-8")
+                bridge.return_value.autoset_edid.return_value = None
+                module.run(**arguments)
+                listen.assert_called_once_with(expected, module.MCPBridgeHandler)
+                self.assertIn("http://{}:{}/mcp".format(*expected), stdout.getvalue())
+                listen.return_value.serve_forever.assert_called_once()
+                listen.return_value.server_close.assert_called_once()
+
+    def test_invalid_mcp_listening_settings_stop_before_network(self):
+        module = load_script("picokvm-mcp.py")
+        settings = [("PICOKVM_MCP_PORT", value) for value in
+                    ("", "abc", "9000.5", "-1", "0", "65536")]
+        settings += [("PICOKVM_MCP_HOST", ""), ("PICOKVM_MCP_HOST", "   ")]
+        for key, value in settings:
+            with self.subTest(key=key, value=value), \
+                    patch.dict(os.environ, {}, clear=True), \
+                    patch.object(module, "__file__", str(self.scripts / "picokvm-mcp.py")), \
+                    patch.object(module, "ThreadingHTTPServer") as listen, \
+                    patch.object(module, "MCPBridge") as bridge, \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                self.env_path.write_text("{}='{}'\n".format(key, value), encoding="utf-8")
+                self.assertEqual(module.run(), 1)
+                listen.assert_not_called()
+                bridge.assert_not_called()
+                self.assertIn("Configuration error:", stderr.getvalue())
+                self.assertIn(key, stderr.getvalue())
+
     def test_bad_configuration_stops_all_entrypoints_before_network(self):
         self.env_path.write_text("PASSWORD='secret\n", encoding="utf-8")
         for filename in SCRIPTS:

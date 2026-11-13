@@ -23,6 +23,8 @@ python picokvm-mcp.py
 load `.env` from their own directory. Keep the shared `picokvm_env.py` module alongside them.
 Environmental value set in shell takes priority than `.env` values.
 
+Set `PICOKVM_MCP_HOST` and `PICOKVM_MCP_PORT` to change the MCP bridge's listening address.
+
 ## supported actions
 
 ### mouse
